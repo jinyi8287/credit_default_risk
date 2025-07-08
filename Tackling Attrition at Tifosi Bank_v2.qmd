@@ -1,0 +1,738 @@
+---
+title: "Tackling Attrition at Tifosi Bank_v2"
+format: pdf
+editor: visual
+---
+
+
+
+
+
+```{r,message=FALSE,warning=FALSE}
+#package
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(here)
+library(readr)
+tidymodels_prefer()
+```
+
+
+
+```{r,message=FALSE}
+raw_data<-read_csv(here("Data","bank_churners.csv")) %>% 
+  clean_names()
+
+```
+
+
+
+
+
+# data split
+
+```{r}
+set.seed(47969938)
+data_split2<- initial_split(raw_data, prop = 0.8, strata = attrition_flag)
+train_data2<- training(data_split2)
+test_data2 <- testing(data_split2)
+# Cross-validation folds
+cross_validation_folds2 <- vfold_cv(train_data2, v = 10, strata = attrition_flag)
+
+```
+
+
+
+# Logistic base model - clean version
+
+```{r}
+# Define model
+base_logistic_spec2 <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+# Define recipe ---------------------------------------------------------------
+logistic_recipe2 <- recipe(attrition_flag ~ ., data = train_data2) |> 
+  step_other(all_nominal_predictors(), threshold = 0.05) |>  # 1. 合併小眾類別
+  step_zv(all_predictors()) |>                               # 2. 移除常數或零變異變數
+  step_corr(all_numeric_predictors(), threshold = 0.7) |>    # 3. 剃掉高相關數值變數
+  step_dummy(all_nominal_predictors()) |>                    # 4. 把類別轉成 0/1 dummy
+  step_normalize(all_numeric_predictors())                   # 5. 標準化數值變數
+
+
+# Create workflow -------------------------------------------------------------
+base_logistic_wf2 <- workflow() |> 
+  add_model(base_logistic_spec2) |> 
+  add_recipe(logistic_recipe2)
+
+# Cross-validation: fit_resamples ---------------------------------------------
+base_logistic_cv2 <- fit_resamples(
+  base_logistic_wf2,
+  resamples = cross_validation_folds2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Evaluation on cross-validation folds ----------------------------------------
+collect_metrics(base_logistic_cv2)
+
+# Last fit: 用 train_data2 fit，predict test_data2
+final_base_fit2 <- last_fit(
+  base_logistic_wf2,
+  split = data_split2,
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect performance on test set
+collect_metrics(final_base_fit2)
+
+
+
+```
+
+
+```{r}
+# 1. prep recipe
+logistic_recipe2_prep <- logistic_recipe2 |> prep()
+
+# 2. check剃除的變數
+tidy(logistic_recipe2_prep, number = 3) |> 
+  filter(terms != "(Intercept)")
+
+```
+```{r}
+tidy(logistic_recipe2_prep)
+
+tidy(logistic_recipe2_prep, number = 4) |> 
+  filter(terms != "(Intercept)")
+```
+
+
+```{r}
+# 先載好必要的套件
+library(vip)
+
+# 畫 Variable Importance Plot
+final_base_fit2 %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20)  # 只列出前20重要的變數
+
+```
+
+# 類別分布 (流失比例)
+
+```{r}
+table(train_data2$attrition_flag)
+prop.table(table(train_data2$attrition_flag))
+```
+
+
+
+
+# 混淆矩陣
+
+```{r}
+final_base_fit2 %>%
+  collect_predictions() %>%
+  conf_mat(truth = attrition_flag, estimate = .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Ridge Logistic Regression (mixture = 0) - clean version
+
+
+```{r}
+# Ridge Logistic Regression (mixture = 0) - clean version
+
+# Define model
+ridge_spec2 <- logistic_reg(
+  penalty = tune(),   # penalty要tune
+  mixture = 0         # mixture = 0 = Ridge
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Create workflow
+ridge_wf2 <- workflow() %>%
+  add_model(ridge_spec2) %>%
+  add_recipe(logistic_recipe2)   # <--- 用乾淨版recipe2
+
+# Define tuning grid
+ridge_grid2 <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 30
+)
+
+# Tuning
+ridge_tune2 <- tune_grid(
+  ridge_wf2,
+  resamples = cross_validation_folds2,  # <--- 用乾淨版folds2
+  grid = ridge_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Select best model
+best_ridge2 <- select_best(ridge_tune2, metric = "roc_auc")
+
+# Finalize workflow
+final_ridge_wf2 <- finalize_workflow(ridge_wf2, best_ridge2)
+
+# Last fit
+final_ridge_fit2 <- last_fit(
+  final_ridge_wf2,
+  split = data_split2,   # <--- 用乾淨版split2
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect metrics
+collect_metrics(final_ridge_fit2)
+
+```
+
+
+
+# Lasso Logistic Regression (mixture = 1) - clean version
+
+
+```{r}
+# Lasso Logistic Regression (mixture = 1) - clean version
+
+# Define model
+lasso_spec2 <- logistic_reg(
+  penalty = tune(),   # penalty要tune
+  mixture = 1         # mixture = 1 = Lasso
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Create workflow
+lasso_wf2 <- workflow() %>%
+  add_model(lasso_spec2) %>%
+  add_recipe(logistic_recipe2)  # 用乾淨版recipe2
+
+# Define tuning grid
+lasso_grid2 <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 30
+)
+
+# Tuning
+lasso_tune2 <- tune_grid(
+  lasso_wf2,
+  resamples = cross_validation_folds2,  # 用乾淨版 folds2
+  grid = lasso_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Select best model
+best_lasso2 <- select_best(lasso_tune2, metric = "roc_auc")
+
+# Finalize workflow
+final_lasso_wf2 <- finalize_workflow(lasso_wf2, best_lasso2)
+
+# Last fit
+final_lasso_fit2 <- last_fit(
+  final_lasso_wf2,
+  split = data_split2,   # 用乾淨版 split2
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect metrics
+collect_metrics(final_lasso_fit2)
+
+```
+
+
+
+
+# Elastic Net Logistic Regression - clean version
+
+```{r}
+# Elastic Net Logistic Regression - clean version
+
+# Define model
+elastic_spec2 <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()    # Elastic Net要tune mixture
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Create workflow
+elastic_wf2 <- workflow() %>%
+  add_model(elastic_spec2) %>%
+  add_recipe(logistic_recipe2)  # 用乾淨版recipe2
+
+# Define tuning grid
+elastic_grid2 <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0, 1)),
+  levels = c(20, 5)             # penalty取20點，mixture取5點
+)
+
+# Tuning
+elastic_tune2 <- tune_grid(
+  elastic_wf2,
+  resamples = cross_validation_folds2,  # 用乾淨版 folds2
+  grid = elastic_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Select best model
+best_elastic2 <- select_best(elastic_tune2, metric = "roc_auc")
+
+# Finalize workflow
+final_elastic_wf2 <- finalize_workflow(elastic_wf2, best_elastic2)
+
+# Last fit
+final_elastic_fit2 <- last_fit(
+  final_elastic_wf2,
+  split = data_split2,  # 用乾淨版 split2
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect metrics
+collect_metrics(final_elastic_fit2)
+
+```
+
+
+
+# KNN - clean version
+
+```{r}
+# KNN - clean version
+
+# 1.1 Define KNN model
+knn_spec2 <- nearest_neighbor(
+  neighbors = tune()
+) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+# 1.2 Define Recipe（記得要normalize）
+knn_recipe2 <- recipe(attrition_flag ~ ., data = train_data2) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(threshold = 0.7) %>%
+  step_normalize(all_numeric_predictors())  # KNN一定要normalize！
+
+# 1.3 Create Workflow
+knn_wf2 <- workflow() %>%
+  add_model(knn_spec2) %>%
+  add_recipe(knn_recipe2)
+
+# 1.4 Define Grid
+knn_grid2 <- grid_regular(
+  neighbors(range = c(3, 50)),
+  levels = 10
+)
+
+# 1.5 Tune
+knn_tuned2 <- tune_grid(
+  knn_wf2,
+  resamples = cross_validation_folds2,   # 用新的 folds2
+  grid = knn_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# 1.6 Select best
+knn_best2 <- select_best(knn_tuned2, metric = "roc_auc")
+
+# 1.7 Finalize
+final_knn_wf2 <- finalize_workflow(knn_wf2, knn_best2)
+
+# 1.8 Last Fit
+knn_final_fit2 <- last_fit(
+  final_knn_wf2,
+  split = data_split2,  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# 1.9 Collect metrics
+collect_metrics(knn_final_fit2)
+
+```
+
+
+# Random Forest - clean version
+
+```{r}
+# Random Forest - clean version
+
+# 2.1 Define Random Forest model
+rf_spec2 <- rand_forest(
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# 2.2 Define Recipe（RF可以不用normalize）
+rf_recipe2 <- recipe(attrition_flag ~ ., data = train_data2) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(threshold = 0.7)
+
+# 2.3 Create Workflow
+rf_wf2 <- workflow() %>%
+  add_model(rf_spec2) %>%
+  add_recipe(rf_recipe2)
+
+# 2.4 Define Grid
+rf_grid2 <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(5, 30)),
+  levels = 5
+)
+
+# 2.5 Tune
+rf_tuned2 <- tune_grid(
+  rf_wf2,
+  resamples = cross_validation_folds2,  # 用新的 folds2
+  grid = rf_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# 2.6 Select best
+rf_best2 <- select_best(rf_tuned2, metric = "roc_auc")
+
+# 2.7 Finalize
+final_rf_wf2 <- finalize_workflow(rf_wf2, rf_best2)
+
+# Last fit
+final_rf_fit2 <- last_fit(
+  final_rf_wf2,
+  split = data_split2,
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect metrics
+collect_metrics(final_rf_fit2)
+
+```
+
+
+
+```{r}
+# 先載好必要的套件
+library(vip)
+
+# 畫 Variable Importance Plot
+final_rf_fit2 %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20)  # 只列出前20重要的變數
+
+```
+
+```{r}
+# RF 混淆矩陣
+rf_conf_mat <- final_rf_fit2 %>%
+  collect_predictions() %>%
+  conf_mat(truth = attrition_flag, estimate = .pred_class)
+
+rf_conf_mat
+
+```
+
+
+```{r}
+tidy(rf_recipe2, number = 4) |> 
+  filter(terms != "(Intercept)")
+
+```
+
+
+```{r}
+# 選數值變數
+numeric_vars <- train_data2 %>% 
+  select(where(is.numeric))
+# 算相關矩陣
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+cor_matrix
+# 找出相關大於0.7的變數組合
+cor_matrix[abs(cor_matrix) > 0.7 & abs(cor_matrix) < 1]
+
+```
+
+
+
+
+
+
+
+# XGBoost - clean version
+
+
+```{r}
+# 3.1 Define XGBoost model
+xgb_spec2 <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# 3.2 Define Recipe（XGB也可以不用normalize）
+xgb_recipe2 <- recipe(attrition_flag ~ ., data = train_data2) %>%
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(threshold = 0.7)
+
+# 3.3 Create Workflow
+xgb_wf2 <- workflow() %>%
+  add_model(xgb_spec2) %>%
+  add_recipe(xgb_recipe2)
+
+# 3.4 Define Grid
+xgb_grid2 <- grid_latin_hypercube(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(2, 10)),
+  learn_rate(range = c(0.01, 0.3)),
+  loss_reduction(range = c(0.0001, 1)),
+  sample_size = sample_prop(range = c(0.5, 1)),
+  mtry(range = c(2, 10)),
+  size = 20
+)
+
+# 3.5 Tune
+xgb_tuned2 <- tune_grid(
+  xgb_wf2,
+  resamples = cross_validation_folds2,  # 用乾淨版 folds2
+  grid = xgb_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# 3.6 Select best
+xgb_best2 <- select_best(xgb_tuned2, metric = "roc_auc")
+
+# 3.7 Finalize
+final_xgb_wf2 <- finalize_workflow(xgb_wf2, xgb_best2)
+
+# Last fit
+final_xgb_fit2 <- last_fit(
+  final_xgb_wf2,
+  split = data_split2,
+  metrics = metric_set( # 直接在此擴充指標
+    roc_auc, 
+    accuracy,
+    recall,     # 新增
+    precision,  # 新增
+    f_meas      # 新增
+))
+
+# Collect metrics
+collect_metrics(final_xgb_fit2)
+
+```
+
+
+
+```{r}
+# XGB 混淆矩陣
+xgb_conf_mat <- final_xgb_fit2 %>%
+  collect_predictions() %>%
+  conf_mat(truth = attrition_flag, estimate = .pred_class)
+
+xgb_conf_mat
+
+```
+
+
+
+
+```{r}
+# 快速比較所有模型 (範例程式碼)
+library(purrr)
+list(
+  logistic = final_base_fit2,
+  ridge = final_ridge_fit2,
+  lasso = final_lasso_fit2,
+  elastic = final_elastic_fit2,
+  knn = knn_final_fit2,
+  rf = final_rf_fit2,
+  xgb = final_xgb_fit2
+) %>% 
+  map_dfr(~collect_metrics(.x) %>% 
+            select(.metric, .estimate) %>% 
+            pivot_wider(names_from = .metric, values_from = .estimate),
+          .id = "model") %>% 
+  arrange(desc(roc_auc))
+```
+
+
+# Random Forest (SMOTE版)
+
+```{r}
+#install.packages("themis")
+
+library(themis)  # 用 SMOTE 要有這個 package
+
+# 新版recipe
+smote_recipe2 <- recipe(attrition_flag ~ ., data = train_data2) %>% 
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.7) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(attrition_flag)   # 🔥 加上 SMOTE
+
+```
+
+
+```{r}
+
+# Random Forest模型設定 (不用變)
+rf_spec2 <- rand_forest(
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Workflow (用 smote_recipe2)
+rf_smote_wf2 <- workflow() %>%
+  add_model(rf_spec2) %>%
+  add_recipe(smote_recipe2)
+
+# Grid
+rf_grid2 <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(5, 30)),
+  levels = 5
+)
+
+# Tune
+rf_smote_tuned2 <- tune_grid(
+  rf_smote_wf2,
+  resamples = cross_validation_folds2,
+  grid = rf_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Select best
+rf_smote_best2 <- select_best(rf_smote_tuned2, metric = "roc_auc")
+
+# Finalize
+rf_smote_final_wf2 <- finalize_workflow(rf_smote_wf2, rf_smote_best2)
+
+# Last Fit
+rf_smote_final_fit2 <- last_fit(
+  rf_smote_final_wf2,
+  split = data_split2,
+  metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas)
+)
+
+# Collect metrics
+collect_metrics(rf_smote_final_fit2)
+```
+
+
+
+
+```{r}
+# XGBoost模型設定 (不用變)
+xgb_spec2 <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Workflow (用 smote_recipe2)
+xgb_smote_wf2 <- workflow() %>%
+  add_model(xgb_spec2) %>%
+  add_recipe(smote_recipe2)
+
+# Grid
+xgb_grid2 <- grid_latin_hypercube(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(2, 10)),
+  learn_rate(range = c(0.01, 0.3)),
+  loss_reduction(range = c(0.0001, 1)),
+  sample_size = sample_prop(range = c(0.5, 1)),
+  mtry(range = c(2, 10)),
+  size = 20
+)
+
+# Tune
+xgb_smote_tuned2 <- tune_grid(
+  xgb_smote_wf2,
+  resamples = cross_validation_folds2,
+  grid = xgb_grid2,
+  metrics = metric_set(roc_auc, accuracy)
+)
+
+# Select best
+xgb_smote_best2 <- select_best(xgb_smote_tuned2, metric = "roc_auc")
+
+# Finalize
+xgb_smote_final_wf2 <- finalize_workflow(xgb_smote_wf2, xgb_smote_best2)
+
+# Last Fit
+xgb_smote_final_fit2 <- last_fit(
+  xgb_smote_final_wf2,
+  split = data_split2,
+  metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas)
+)
+
+# Collect metrics
+collect_metrics(xgb_smote_final_fit2)
+
+```
+

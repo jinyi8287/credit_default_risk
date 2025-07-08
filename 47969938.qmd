@@ -1,0 +1,1301 @@
+---
+title: "Tifosi Bank’s Hidden Risk: A Predictive Approach to Customer Churn"
+subtitle: "Machine Learning Insights to Drive Retention"
+author: "Jinyi Tzeng 47969938"
+format:
+  pdf:
+    pdf-engine: xelatex
+    toc: false
+    number-sections: true
+    keep-tex: true
+    include-in-header: header.tex  
+mainfont: "Times New Roman"
+editor: visual
+---
+
+\newpage
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# Accelerate model training 
+
+# Load the parallel backend package
+library(doParallel)
+# Create a parallel backend using available CPU cores minus one
+# makePSOCKcluster() sets up a socket-based cluster for parallel execution
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# Stop the parallel cluster to release system resources
+stopCluster(cl)
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# Load packages 
+
+library(tidyverse)      # For data manipulation and visualization
+library(tidymodels)     # package for machine learning workflows
+library(janitor)        # For data cleaning 
+library(skimr)          # For data summaries
+library(here)           # For building file paths relative to the project root
+library(readr)          # For reading CSV files 
+library(dplyr)          # For data manipulation 
+library(tidyr)          # For data reshaping and tidying 
+library(knitr)          # For rendering tables 
+library(ggplot2)        # For visualisation
+library(forcats)
+library(yardstick)      # Load yardstick package for model evaluation
+library(vip)            # Variable Importance Plot
+
+# Resolve function conflicts giving tidymodels packages priority
+tidymodels_prefer()
+
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# modeling
+
+# Load the raw data and apply initial cleaning
+# Standardize column names to lowercase with underscores
+# Convert all character variables to factors for modelling
+# Remove the client ID column, which is not predictive
+raw_data<-read_csv(here("Data","bank_churners.csv")) %>% 
+  clean_names() %>% 
+  mutate(across(where(is.character), as_factor)) %>% 
+  select(-clientnum)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+
+# Set seed for reproducibility
+set.seed(47969938)
+
+# Split the dataset into 80% training and 20% testing sets
+# Stratified by 'attrition_flag' to maintain class balance in both sets
+data_split<- initial_split(raw_data, prop = 0.8, strata = attrition_flag)
+train_data<- training(data_split)
+test_data<- testing(data_split)
+
+# Create 10-fold cross-validation folds from the training data
+# Stratified by 'attrition_flag' to preserve class distribution across folds
+cross_validation_folds <- vfold_cv(train_data, v = 10, strata = attrition_flag)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## Logistic Regression (Baseline Model)
+
+# Define the logistic regression model using glm engine
+logistic_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+# Create preprocessing recipe:
+# - One-hot encode categorical predictors
+# - Remove predictors with zero variance
+# - Standardise numeric predictors
+
+logistic_recipe <- recipe(attrition_flag ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%            
+  step_zv(all_predictors()) %>%                        
+  step_normalize(all_numeric_predictors()) 
+
+
+# Combine the model and recipe into a workflow
+logistic_wf <- workflow() |> 
+  add_model(logistic_spec) |> 
+  add_recipe(logistic_recipe)
+
+
+
+# Cross-validation workflow for logistic regression
+# This block was used during development to assess CV performance,
+# but was replaced by last_fit() for final model evaluation on test data.
+
+
+# Perform 10-fold cross-validation on the logistic model
+# Use the logistic regression workflow (model + recipe)
+# Predefined folds stratified by churn outcome
+# Evaluation metrics to be calculated for each fold
+
+
+logistic_cv <- fit_resamples(
+ logistic_wf,
+  resamples = cross_validation_folds,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas),
+  control = control_resamples(
+    save_pred = TRUE, # Save predictions for each fold
+    event_level = "second" # Treat 'Attrited Customer' as the positive class
+  )
+)
+
+
+############################################################################
+
+# Summarise cross-validation results into a metrics table
+#collect_metrics(logistic_cv)
+
+
+# Fit the final logistic regression model on full training data
+final_logistic_fit <- last_fit(
+ logistic_wf,
+  split = data_split,
+  metrics = metric_set( 
+    roc_auc, 
+    accuracy,
+    recall,     
+    precision,  
+    f_meas      
+))
+
+
+
+##############################################################################
+#optional (avoid recomputation)
+#saveRDS(final_logistic_fit, file = "models/final_logistic_fit.rds")
+
+
+# Optional:If it's the best performance model##################################
+# Final evaluation using last_fit 
+# The model has already been saved, read it from disk to avoid retraining
+#if (file.exists("models/final_logistic_fit.rds")) {
+#  final_logistic_fit <- readRDS("models/final_logistic_fit.rds")
+#} else {
+#  final_logistic_fit <- last_fit(
+#    logistic_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas)
+#  )
+#  saveRDS(final_logistic_fit, file = "models/final_logistic_fit.rds")
+#}
+#############################################################################
+
+
+# Collect performance metrics on the test set
+logistic_metrics <-collect_metrics(final_logistic_fit)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## Ridge Logistic Regression (mixture = 0)
+
+# Define a regularised logistic regression model (Ridge = mixture 0)
+# 'penalty' is tuned across a grid of lambda values
+ridge_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 0
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Combine the model and recipe into a workflow
+ridge_wf <- workflow() %>%
+  add_model(ridge_spec) %>%
+  add_recipe(logistic_recipe)
+
+# # Define a regular grid of penalty values (lambda) on log scale
+# This uses 30 levels from 10^-4 to 10^0
+ridge_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 30
+)
+
+
+# 4. Cross-validation tuning
+ridge_tune <- tune_grid(
+  ridge_wf,
+  resamples = cross_validation_folds, 
+  grid = 50,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas),
+  control = control_grid(
+    save_pred = TRUE,
+    event_level = "second",
+    verbose = TRUE
+  )
+)
+
+
+
+
+# Select the best hyperparameter based on ROC AUC
+best_ridge <- select_best(ridge_tune, metric = "roc_auc")
+
+
+
+
+
+# Finalize the workflow with the selected penalty value
+final_ridge_wf <- finalize_workflow(ridge_wf, best_ridge)
+
+
+
+# last fit
+final_ridge_fit <- last_fit(
+  final_ridge_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+#########################################################################
+#optional (avoid recomputation)
+# Save tuning results (uncomment and run once to create the file)
+#saveRDS(ridge_tune, file = "models/ridge_tune_result.rds")
+
+
+# Load tuning results from RDS file (to avoid recomputation)
+#ridge_tune <- readRDS("models/ridge_tune_result.rds")
+
+# Fit the final model using training set and evaluate on test set
+#if (file.exists("models/final_ridge_fit.rds")) {
+#  final_ridge_fit <- readRDS("models/final_ridge_fit.rds")
+#} else {
+#  final_ridge_fit <- last_fit(
+#    final_ridge_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas)
+#  )
+#  if (!dir.exists("models")) dir.create("models")
+#  saveRDS(final_ridge_fit, "models/final_ridge_fit.rds")
+#}
+########################################################################
+# Collect final performance metrics on the test set
+ridge_metrics <- collect_metrics(final_ridge_fit)
+
+
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## Lasso Logistic Regression (mixture = 1)
+
+# Define a regularised logistic regression model using Lasso (mixture = 1)
+# 'penalty' is the lambda value to be tuned
+lasso_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 1
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Create workflow by combining model and preprocessing recipe
+lasso_wf <- workflow() %>%
+  add_model(lasso_spec) %>%
+  add_recipe(logistic_recipe)
+
+----------------------------------------------------------------------
+
+lasso_tune <- tune_grid(
+   lasso_wf,
+   resamples = cross_validation_folds,
+   grid = 50,  # Tune over 50 randomly selected penalty values
+   metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas),
+   control = control_grid(
+     save_pred = TRUE,
+     event_level = "second",  # Treat 'Attrited Customer' as the positive class
+     verbose = TRUE
+   )
+ )
+
+
+
+# Select the best hyperparameter based on ROC AUC
+best_lasso <- select_best(lasso_tune, metric = "roc_auc")
+
+# Finalize the workflow with the selected penalty
+final_lasso_wf <- finalize_workflow(lasso_wf, best_lasso)
+
+
+# last fit
+final_lasso_fit <- last_fit(
+  final_lasso_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+#############################################################################
+#optional (avoid recomputation)
+# Save tuning results 
+# saveRDS(lasso_tune, "models/lasso_tune_result.rds")
+
+# Load previously saved tuning results
+#lasso_tune <- readRDS("models/lasso_tune_result.rds")
+
+# Fit the final model using training data and evaluate on test set
+# Load cached results if available
+#if (file.exists("models/final_lasso_fit.rds")) {
+#  final_lasso_fit <- readRDS("models/final_lasso_fit.rds")
+#} else {
+#  final_lasso_fit <- last_fit(
+#    final_lasso_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_lasso_fit, "models/final_lasso_fit.rds")
+#}
+##############################################################################
+
+# Collect final performance metrics on the test set
+lasso_metrics <- collect_metrics(final_lasso_fit)
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## Elastic Net Logistic Regression (mixture between 0 and 1)
+
+# Define a logistic regression model with both L1 (lasso) and L2 (ridge) penalties
+# Both 'penalty' (lambda) and 'mixture' (alpha) will be tuned
+elastic_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# Create a workflow combining the model and preprocessing recipe
+elastic_wf <- workflow() %>%
+  add_model(elastic_spec) %>%
+  add_recipe(logistic_recipe)
+
+------------------------------------------------------------------
+
+ elastic_tune <- tune_grid(
+   elastic_wf,
+   resamples = cross_validation_folds,
+   grid = 50,  # Randomly sample 50 combinations of penalty and mixture
+   metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+   control = control_grid(
+     save_pred = TRUE,
+     event_level = "second",  # Positive class = 'Attrited Customer'
+     verbose = TRUE
+   )
+ )
+
+
+
+# Select the best combination of penalty and mixture based on ROC AUC
+best_elastic <- select_best(elastic_tune, metric = "roc_auc")
+
+# Finalize the workflow with selected hyperparameters
+final_elastic_wf <- finalize_workflow(elastic_wf, best_elastic)
+
+# last fit
+final_elastic_fit <- last_fit(
+  final_elastic_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+#############################################################################
+#optional (avoid recomputation)
+# Save tuning results (optional, run once)
+# saveRDS(elastic_tune, "models/elastic_tune_result.rds")
+
+# Load previously saved tuning results
+#elastic_tune <- readRDS("models/elastic_tune_result.rds")
+
+# Fit the final model and evaluate it on the test set
+# Use saved result if available to avoid retraining
+#if (file.exists("models/final_elastic_fit.rds")) {
+#  final_elastic_fit <- readRDS("models/final_elastic_fit.rds")
+#} else {
+#  final_elastic_fit <- last_fit(
+#    final_elastic_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas)
+#  )
+#  saveRDS(final_elastic_fit, "models/final_elastic_fit.rds")
+#}
+#############################################################################
+
+
+
+
+
+
+# Collect performance metrics on the test set
+elastic_metrics <- collect_metrics(final_elastic_fit)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## K-Nearest Neighbors (KNN) Classification Model
+
+# Define a KNN classifier with three hyperparameters to tune:
+# - neighbors: number of nearest neighbors (k)
+# - dist_power: distance weighting exponent (p in Minkowski distance)
+# - weight_func: method for weighting neighbors (e.g., "rectangular", "triweight")
+knn_spec <- nearest_neighbor(
+  neighbors = tune(),
+  dist_power = tune(),
+  weight_func = tune()
+) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+# Create a preprocessing recipe:
+# - One-hot encode categorical predictors
+# - Normalize numeric predictors (KNN is distance-based)
+# - Remove predictors with zero variance
+knn_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+# Combine model and recipe into a workflow
+knn_wf <- workflow() %>%
+  add_recipe(knn_rec) %>%
+  add_model(knn_spec)
+
+
+ knn_tune <- tune_grid(
+  knn_wf,
+   resamples = cross_validation_folds,
+   grid = 20,  # Tune over 20 random combinations
+   metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+   control = control_grid(
+     save_pred = TRUE,
+     event_level = "second",  # Treat 'Attrited Customer' as the positive class
+     verbose = TRUE
+   )
+ )
+
+
+# last fit
+final_knn_fit <- last_fit(
+  knn_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+#############################################################################
+#optional (avoid recomputation)
+# Save tuning results (run once)
+# saveRDS(knn_tune, file = "models/knn_tune_result.rds")
+
+# Load previously saved tuning results
+#knn_tune <- readRDS("models/knn_tune_result.rds")
+
+
+
+# Fit the final model and evaluate on the test set
+# Load from file if already saved to avoid retraining
+#if (file.exists("models/final_knn_fit.rds")) {
+#  final_knn_fit <- readRDS("models/final_knn_fit.rds")
+#} else {
+#  final_knn_fit <- last_fit(
+#    final_knn_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_knn_fit, "models/final_knn_fit.rds")
+#}
+##############################################################################
+
+# Select the best parameter combination based on ROC AUC
+best_knn <- select_best(knn_tune, metric = "roc_auc")
+
+# Finalize the workflow with selected hyperparameters
+final_knn_wf <- finalize_workflow(knn_wf, best_knn)
+# Collect performance metrics on the test set
+knn_metrics <- collect_metrics(final_knn_fit)
+
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## Random Forest Classification Model
+
+# Define a Random Forest model using the 'ranger' engine
+# Hyperparameters to tune:
+# - mtry: number of variables randomly sampled at each split
+# - min_n: minimum number of data points in a node
+# - trees: number of trees in the forest
+rf_spec <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+# Create a preprocessing recipe for Random Forest
+# Although RF does not require normalization or dummy encoding,
+# we include dummy and normalization steps for consistency with other models
+rf_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+
+
+# Combine the model and recipe into a workflow
+rf_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(rf_spec)
+
+
+
+ rf_tune <- tune_grid(
+   rf_wf,
+   resamples = cross_validation_folds,
+   grid = 20,  # Tune over 20 randomly selected combinations
+   metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+   control = control_grid(
+     save_pred = TRUE,
+     event_level = "second",  # Positive class = 'Attrited Customer'
+     verbose = TRUE,
+     parallel_over = "everything"  # Enable parallel tuning over folds and parameters
+   )
+ )
+
+
+
+# Select the best combination of hyperparameters based on ROC AUC
+best_rf <- select_best(rf_tune, metric = "roc_auc")
+
+# Finalize the workflow with selected parameters
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+
+
+# last fit
+final_rf_fit <- last_fit(
+  final_rf_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+
+############################################################################
+#optional (avoid recomputation)
+# Save tuning results (run once)
+# saveRDS(rf_tune, "models/rf_tune_result.rds")
+
+# Load previously saved tuning results
+#rf_tune <- readRDS("models/rf_tune_result.rds")
+
+# Fit the final model and evaluate on the test set
+# Load from cache if result already exists
+#if (file.exists("models/final_rf_fit.rds")) {
+#  final_rf_fit <- readRDS("models/final_rf_fit.rds")
+#} else {
+#  final_rf_fit <- last_fit(
+#    final_rf_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+# )
+#  saveRDS(final_rf_fit, "models/final_rf_fit.rds")
+#}
+############################################################################
+
+
+# Collect test set performance metrics
+rf_metrics <- collect_metrics(final_rf_fit)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+## XGBoost Classification Model
+
+# Define an XGBoost model specification with multiple hyperparameters to tune:
+# - trees: number of boosting rounds (iterations)
+# - tree_depth: maximum depth of a tree
+# - learn_rate: shrinkage parameter (eta)
+# - loss_reduction: minimum loss reduction for further splitting (gamma)
+# - sample_size: subsampling rate (for rows)
+# - mtry: number of predictors sampled at each split
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Preprocessing recipe:
+# - One-hot encode categorical variables
+# - Normalize numeric features
+# - Remove predictors with zero variance
+xgb_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# Combine the recipe and model into a workflow
+xgb_wf <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(xgb_rec)
+
+
+ xgb_tune <- tune_grid(
+   xgb_wf,
+   resamples = cross_validation_folds,
+   grid = 20,  # Tune over 20 randomly selected combinations
+   metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+   control = control_grid(
+     save_pred = TRUE,
+     event_level = "second",  # Positive class = 'Attrited Customer'
+     verbose = TRUE,
+     parallel_over = "everything"  # Enable parallel tuning
+   )
+ )
+
+ 
+ 
+ 
+
+
+# Select best hyperparameter combination based on ROC AUC
+best_xgb <- select_best(xgb_tune, metric = "roc_auc")
+
+# Finalize the workflow with the selected parameters
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+
+############################################################################
+#optional (avoid recomputation)
+
+# Save tuning results (run once)
+# saveRDS(xgb_tune, "models/xgb_tune_result.rds")
+
+# Load previously saved tuning results
+#xgb_tune <- readRDS("models/xgb_tune_result.rds")
+
+# Fit the final model and evaluate on the test set
+# Load from cache if result already exists
+#if (file.exists("models/final_xgb_fit.rds")) {
+#  final_xgb_fit <- readRDS("models/final_xgb_fit.rds")
+#} else {
+#  final_xgb_fit <- last_fit(
+#    final_xgb_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_xgb_fit, "models/final_xgb_fit.rds")
+#}
+#############################################################################
+
+
+# last fit
+final_xgb_fit <- last_fit(
+  final_xgb_wf,
+  split = data_split,
+  metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+)
+
+# Collect performance metrics on the test set
+xgb_metrics <- collect_metrics(final_xgb_fit)
+
+
+```
+
+# Executive Summary
+
+For financial institutions like Tifosi Bank, customers are among the most valuable assets. Reducing customer attrition has long been a strategic priority, as every lost customer not only translates to immediate revenue loss but also diminishes future growth opportunities. Moreover, acquiring new customers is often significantly more expensive than retaining existing ones. In this context, establishing a robust churn prediction and analysis framework is essential for strengthening the bank’s competitive edge.
+
+This study applies machine learning techniques to analyse customer churn risk using Tifosi Bank’s credit card customer dataset. By developing a suite of classification models—including Logistic Regression, Ridge/Lasso, Elastic Net, KNN, Random Forest, and XGBoost—we systematically explored the relationship between customer characteristics and attrition behaviour.
+
+Model performance was evaluated using multiple metrics. XGBoost clearly outperformed all other models and emerged as the optimal classifier due to its superiority across three key dimensions:
+
+-   **Generalisation**: Achieved a ROC AUC of 0.996, indicating strong discriminative power on unseen data.
+-   **Precision**: Reached 0.984, reducing false positives and limiting unnecessary retention costs for high-value customers.
+-   **Recall**: Attained 0.990, ensuring that nearly all churned customers were correctly identified.
+
+Recognising the inherent trade-off between precision and recall, we further assessed F1 Score (0.987) to validate XGBoost’s ability to maintain a strong balance between these two goals. Based on this comprehensive evaluation, XGBoost was selected as the best-performing model for this analysis.
+
+Based on the model’s variable importance analysis, three high-risk customer segments were identified: (1) customers with declining transaction frequency, (2) older customers and those with high credit limits, and (3) customers with frequent contact with customer service.
+
+We recommend Tifosi Bank take the following actions:\
+– **Re-engagement campaigns** for low-activity customers through cashback offers, reminder emails, or limited-time promotions. For instance, JPMorgan Chase's email reactivation campaigns showed a 12% re-engagement rate in similar segments (Forrester, 2023).\
+– **Tailored retention offers** for older or high-credit customers, such as personalised interest reviews, loyalty perks, or bundled financial products, which have been shown to improve customer stickiness in senior segments (Deloitte, 2021).\
+– **Service quality improvements** for frequent callers by flagging them for proactive support and routing them to experienced agents. Citibank's churn-risk scoring includes service logs as a key input for customer dissatisfaction (IBM, 2020).
+
+These strategies enable Tifosi Bank to move from reactive churn mitigation to a proactive, data-driven retention approach.
+
+# Introduction & Business Context
+
+Credit card churn poses a significant threat to the profitability, customer lifetime value, and strategic growth of retail banks. With credit card operations contributing up to 25% of a bank’s retail revenue—driven by interest income, interchange fees, annual charges, and cross-selling opportunities (McKinsey, 2023)—a rising churn rate represents not just a revenue loss but a potential erosion of customer trust and competitive positioning.
+
+For Tifosi Bank, a recent spike in credit card attrition raises concerns about declining engagement and highlights the need for timely intervention. Left unaddressed, this trend may increase acquisition costs, weaken cross-sell pipelines, and undermine long-term market share. Identifying high-risk segments and understanding the key behavioral or demographic drivers of churn is essential to enable targeted, cost-effective retention strategies.
+
+This report applies predictive modeling techniques to develop a churn classification framework tailored to Tifosi Bank’s credit card portfolio. By leveraging machine learning on behavioral and demographic data, we aim to provide actionable insights that inform retention planning, resource allocation, and customer experience management—ultimately helping leadership mitigate risk and sustain growth in a highly competitive market.
+
+# Analytical Overview
+
+## Dataset Summary
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+#skim
+#skim(raw_data)
+#variables
+#names(raw_data)
+```
+
+The dataset from Tifosi Bank consists of 10,127 credit card customers, each represented by a range of 21 variables across three main feature groups: – Demographic information (e.g., age, income, education level) – Behavioural indicators (e.g., transaction amounts, credit usage ratios) – Account relationship metrics (e.g., months on book, number of products held)
+
+The target variable, Attrition_Flag, is a binary indicator of customer status, where "Attrited Customer" denotes churn and "Existing Customer" indicates retention. The dataset is imbalanced, with only around 16% of customers having churned, which presents additional considerations when building predictive models.
+
+\newpage
+
+Table 1. Representative Variables by Group
+
+![](figures/key_variables_summary.png){fig-align="center" fig-cap="Figure 1. Summary of Key Variables by Category"}
+
+Note: This table only shows representative variables from each category. Full feature set used in modeling.
+
+\newpage
+
+## Exploratory View
+
+### Churn rate is crucial
+
+Only 16.1% of customers have churned, revealing a highly imbalanced dataset. This reinforces the importance of using appropriate evaluation metrics—such as ROC AUC and recall—that are less sensitive to imbalance than accuracy alone.
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE, fig.width = 5, fig.height = 4, out.width = "80%", fig.align = "center"}
+
+churn_plot_data <- raw_data %>%
+  count(attrition_flag) %>%
+  mutate(percent = round(n / sum(n) * 100, 1),
+         label = paste0(percent, "%"))
+
+
+ggplot(churn_plot_data, aes(x = attrition_flag, y = n, fill = attrition_flag)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = 0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("Attrited Customer" = "red", "Existing Customer" = "darkgreen")) +
+  labs(
+    title = "Customer Churn Poses a Risk to Retention",
+    subtitle = "16% of credit card clients have churned — early detection is critical",
+    x = "Customer Status",
+    y = "Number of Customers"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 8),
+    axis.text = element_text(color = "black"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+```
+
+### Total transaction count shows more evidence
+
+Customers who churned exhibit markedly fewer transactions over the past year. The median transaction count is significantly lower compared to retained customers, and the distribution is more compressed. This confirms transactional activity as a key behavioral indicator of churn.
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE, fig.width = 5, fig.height = 4, out.width = "80%", fig.align = "center"}
+ggplot(raw_data, aes(x = attrition_flag, y = total_trans_ct, fill = attrition_flag)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = 16, outlier.size = 2) +
+  scale_fill_manual(values = c("red", "darkgreen")) +
+  labs(
+    title = "Distribution of Total Transactions by Customer Status",
+    subtitle = "Customers who churned tend to have fewer transactions",
+    x = "Customer Status",
+    y = "Total Transactions (12 months)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+## Analyzing Workflow Summary
+
+To predict customer attrition at Tifosi Bank, we implemented a structured modelling workflow comprising data preparation, feature engineering, model development, and performance evaluation. The raw dataset was first cleaned and preprocessed by removing irrelevant identifiers, converting character variables to factors, and splitting the data into training and testing sets.
+
+Key preprocessing steps included encoding categorical variables, removing near-zero variance and highly correlated predictors, and standardising numerical features. To account for model-specific requirements, we constructed tailored preprocessing pipelines (recipes) for each algorithm. To ensure model generalisability, we employed 10-fold cross-validation on the training data, stratified by churn status.
+
+We developed and tuned a range of classification models, including baseline logistic regression, regularised models (ridge, lasso, elastic net), k-nearest neighbors (KNN), random forest, and extreme gradient boosting (XGBoost). Each model was tuned using grid search to optimise key hyperparameters, and performance was evaluated using ROC AUC, precision, recall, accuracy, and F1 score.
+
+After identifying the best-performing models through cross-validation, we retrained them on the full training set and assessed their predictive performance on the test set. This end-to-end workflow allowed for both accurate prediction and insightful comparison across modelling approaches.
+
+![Workflow Overview](Output/Workflow%20Overview.png){width="85%" fig-align="center"}
+
+## Why This Approach ?
+
+Given the high stakes of customer churn, a robust predictive strategy was necessary. Rather than relying on a single model, we employed multiple algorithms to compare performance across different assumptions and learning styles. This approach ensures reliability, maximises predictive accuracy, and provides interpretable outputs for business decision-making.
+
+\newpage
+
+# Key Insights & Visual Storytelling
+
+## Model Performance Comparison
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+
+# Combine test set metrics from all models into a single comparison table
+#model_comparison <- bind_rows(
+#  logistic_metrics %>% mutate(Model = "Logistic"),
+#  ridge_metrics %>% mutate(Model = "Ridge"),
+#  lasso_metrics %>% mutate(Model = "Lasso"),
+#  elastic_metrics %>% mutate(Model = "Elastic Net"),
+#  knn_metrics %>% mutate(Model = "KNN"),
+#  rf_metrics %>% mutate(Model = "Random Forest"),
+#  xgb_metrics %>% mutate(Model = "XGBoost")
+#) %>%
+  # Keep only relevant columns: model name, metric name, and value  
+#  select(Model, .metric, .estimate) %>%
+   # Reshape from long to wide format for display (metrics as columns)
+#  pivot_wider(names_from = .metric, values_from = .estimate)
+
+ # Display the comparison table using knitr::kable with 3 decimal places
+#kable(model_comparison, digits = 3, caption = "Model Performance Comparison (Test Set)")
+
+```
+
+To identify the most effective model for churn prediction, we compared seven classification algorithms across five evaluation metrics: accuracy, recall, precision, F1 score, and area under the ROC curve (AUC). Table 1 presents the performance summary on the hold-out test set.
+
+Overall, XGBoost emerged as the top-performing model, achieving the highest scores across all metrics. It attained an accuracy of 0.978, a recall of 0.990, and a precision of 0.984, leading to an F1 score of 0.987 and an AUC of 0.996. These results indicate exceptional discriminative power and balance between false positives and false negatives.
+
+Random Forest also demonstrated strong performance, with a recall of 0.992 and an F1 score of 0.979. However, its precision and AUC remained slightly below that of XGBoost. Among the simpler models, logistic regression and its regularised variants (ridge, lasso, elastic net) performed consistently but less competitively, with AUC values around 0.931. KNN achieved the highest recall among non-tree-based models (0.987) but showed lower precision and AUC.
+
+These comparisons provided a robust justification for selecting XGBoost as the final model for churn classification.
+
+| Model         | Accuracy | Recall | Precision | F1 Score | ROC AUC |
+|---------------|----------|--------|-----------|----------|---------|
+| Logistic      | 0.909    | 0.963  | 0.931     | 0.947    | 0.931   |
+| Ridge         | 0.905    | 0.978  | 0.915     | 0.945    | 0.922   |
+| Lasso         | 0.909    | 0.963  | 0.931     | 0.947    | 0.931   |
+| Elastic Net   | 0.909    | 0.963  | 0.931     | 0.947    | 0.931   |
+| KNN           | 0.901    | 0.987  | 0.904     | 0.943    | 0.926   |
+| Random Forest | 0.965    | 0.992  | 0.967     | 0.979    | 0.993   |
+| XGBoost       | 0.978    | 0.990  | 0.984     | 0.987    | 0.996   |
+
+## Visual Evaluation
+
+### ROC Curve-Generalisation ability
+
+The figure presents the ROC curve (Receiver Operating Characteristic) for the XGBoost model, which evaluates the model’s ability to distinguish between customers who churned and those who remained. A ROC curve that closely follows the top-left border of the graph indicates a highly effective model, as it reflects a strong balance between sensitivity (true positive rate) and specificity (false positive rate). In this case, the curve demonstrates an Area Under the Curve (AUC) value of 0.996, which is near perfect.
+
+This exceptionally high AUC suggests that the model can almost flawlessly separate churned customers from those who stay, even when applied to new, unseen data. Such performance confirms the model’s strong generalisation capacity, which is critical for real-world deployment. For Tifosi Bank, this means that the model provides a highly reliable foundation for predicting churn risk and supporting timely, data-driven retention strategies.
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# Load prediction results from last_fit() objects
+pred_xgb <- final_xgb_fit %>% collect_predictions()
+pred_rf  <- final_rf_fit %>% collect_predictions()
+pred_log <- final_logistic_fit %>% collect_predictions()
+
+# Relevel the outcome variable to ensure the positive class is correctly interpreted
+# 'Attrited Customer' should be treated as the event of interest (i.e., positive class)
+pred_xgb <- pred_xgb %>% mutate(attrition_flag = fct_relevel(attrition_flag, "Attrited Customer"))
+pred_rf  <- pred_rf  %>% mutate(attrition_flag = fct_relevel(attrition_flag, "Attrited Customer"))
+pred_log <- pred_log %>% mutate(attrition_flag = fct_relevel(attrition_flag, "Attrited Customer"))
+
+# Compute ROC AUC for each model
+xgb_auc <- roc_auc(pred_xgb, attrition_flag, `.pred_Attrited Customer`)
+rf_auc  <- roc_auc(pred_rf,  attrition_flag, `.pred_Attrited Customer`)
+log_auc <- roc_auc(pred_log, attrition_flag, `.pred_Attrited Customer`)
+
+# Create ROC curve data for each model
+xgb_roc <- yardstick::roc_curve(pred_xgb, attrition_flag, `.pred_Attrited Customer`) %>%
+  mutate(Model = "XGBoost")
+rf_roc  <- yardstick::roc_curve(pred_rf,  attrition_flag, `.pred_Attrited Customer`) %>%
+  mutate(Model = "Random Forest")
+log_roc <- yardstick::roc_curve(pred_log, attrition_flag, `.pred_Attrited Customer`) %>%
+  mutate(Model = "Logistic")
+
+# Combine ROC curve data from all models
+all_roc <- bind_rows(xgb_roc, rf_roc, log_roc)
+
+# Plot ROC curves for all models
+ggplot(all_roc, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+  geom_line(size = 1.2) +  # ROC curve
+  geom_abline(linetype = "dashed", color = "gray") +  # Diagonal reference line
+  labs(
+    title = "Model Comparison Using ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  annotate("text", x = 0.6, y = 0.25, hjust = 0.2, size = 4,
+           label = paste0(
+             "XGBoost AUC = ", round(xgb_auc$.estimate, 3), "\n",
+             "Random Forest AUC = ", round(rf_auc$.estimate, 3), "\n",
+             "Logistic AUC = ", round(log_auc$.estimate, 3)
+           )) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+### Confusion Matrix-who it predicts correctly, and where it misfires
+
+The confusion matrix illustrates that the XGBoost model demonstrates strong predictive performance at a threshold of 0.5, correctly classifying 1,982 out of 2,026 customers. The breakdown is as follows:
+
+True Positives (TP = 299): Customers who actually churned and were correctly identified by the model. These customers represent actionable cases where proactive retention strategies could be applied to prevent revenue loss.
+
+True Negatives (TN = 1,683): Customers who stayed and were accurately predicted as such. Correctly identifying loyal customers allows the bank to avoid unnecessary retention efforts and focus resources efficiently.
+
+False Positives (FP = 17): Customers who were incorrectly predicted to churn but actually stayed. While these cases may result in slightly redundant outreach, they pose minimal business risk and may even improve customer engagement.
+
+False Negatives (FN = 27): Customers who churned but were missed by the model. These represent missed intervention opportunities and are the most critical from a risk management standpoint.
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+
+# Create predicted class labels based on threshold = 0.5
+# If predicted probability ≥ 0.5, classify as 'Attrited Customer'; otherwise, 'Existing Customer'
+# Factor levels are matched to the original response variable to preserve order
+pred_class_df <- pred_xgb %>%
+  mutate(
+    pred_class = factor(
+      if_else(`.pred_Attrited Customer` >= 0.5, "Attrited Customer", "Existing Customer"),
+      levels = levels(attrition_flag)  # Ensure consistent level order
+    )
+  )
+
+# Generate confusion matrix comparing predicted vs actual class labels
+confusion_matrix<-conf_mat(pred_class_df, truth = attrition_flag, estimate = pred_class)
+
+# Visualise the confusion matrix as a heatmap
+conf_mat(pred_class_df, truth = attrition_flag, estimate = pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "gray", high = "#1C61B6") +
+  labs(title = "Confusion Matrix ")
+
+```
+
+## Key Factors of Churn
+
+To gain insight into the drivers of customer attrition, we analysed the variable importance rankings produced by the XGBoost model. As shown in Figure 4, behavioural features dominated the top positions, highlighting the strong predictive power of customer activity patterns over demographic traits.
+
+The most influential variable was **total transaction count**, with churned customers exhibiting significantly fewer transactions compared to retained ones. This was followed by **total transaction amount**, reinforcing the role of spending engagement as a key churn indicator. The third-ranked predictor, **total revolving balance**, suggests that customers carrying higher outstanding balances may be more prone to disengagement or financial stress.
+
+Additionally, **change in transaction count between Q4 and Q1** emerged as a high-impact dynamic variable, signalling that a recent decline in activity is a leading indicator of potential churn. The **total number of products or relationships held** with the bank also featured prominently, where lower relationship depth was associated with higher churn probability.
+
+Interestingly, demographic features such as gender, education level, and income category had relatively low importance, underscoring the greater value of behavioural signals in churn prediction.
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+
+# Extract the fitted XGBoost model object from the final workflow
+#xgb_model <- extract_fit_parsnip(final_xgb_fit)$fit
+
+# Plot the top 20 most important features based on 'gain' importance
+# 'gain' measures the average contribution of a feature to the model's splits
+vip(xgb_model, num_features = 20, geom = "col", aesthetics = list(fill = "steelblue")) +
+  labs(
+    title = "XGBoost – Variable Importance Plot",
+    x = "Predictors",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# rename to predictors readability
+var_labels <- c(
+  total_trans_ct = "Total Transaction Count (12m)",
+  total_trans_amt = "Total Transaction Amount (12m)",
+  total_revolving_bal = "Revolving Balance",
+  total_ct_chng_q4_q1 = "Transaction Count Change (Q4 to Q1)",
+  total_relationship_count = "Number of Products Held",
+  total_amt_chng_q4_q1 = "Transaction Amount Change (Q4 to Q1)",
+  customer_age = "Customer Age",
+  months_inactive_12_mon = "Inactive Months (12m)",
+  contacts_count_12_mon = "Contact Frequency (12m)",
+  avg_utilization_ratio = "Credit Utilization Ratio",
+  credit_limit = "Credit Limit",
+  avg_open_to_buy = "Available Credit",
+  months_on_book = "Tenure (Months)",
+  dependent_count = "Dependents",
+  gender_F = "Gender: Female",
+  marital_status_Single = "Single",
+  education_level_Uneducated = "Uneducated",
+  marital_status_Divorced = "Divorced",
+  education_level_Unknown = "Unknown Education",
+  income_category_X.40K...60K = "Income: $40K–$60K"
+)
+
+# Extract the fitted XGBoost model object from the final workflow
+xgb_model <- extract_fit_parsnip(final_xgb_fit)$fit
+
+vip_data <- vip(xgb_model, num_features = 20, geom = "col")$data
+
+
+vip_data$Variable <- ifelse(
+  vip_data$Variable %in% names(var_labels),
+  var_labels[vip_data$Variable],
+  vip_data$Variable
+)
+
+
+ggplot(vip_data, aes(x = Importance, y = reorder(Variable, Importance))) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Variable Importance Plot(XGBoost)",
+    x = "Importance",
+    y = "Predictors"
+  ) +
+  theme_minimal()
+
+```
+
+## Interpretation & Strategic Implications
+
+The results of the XGBoost model provide several useful insights for Tifosi Bank’s customer retention strategy. The most important factor was the number of credit card transactions. Customers who made fewer transactions were much more likely to leave the bank. This means that low activity can be an early warning sign of churn.
+
+Transaction amount and revolving balance were also strong predictors. Customers who spent less, or who carried high unpaid balances, showed a higher chance of leaving. These patterns suggest that both low engagement and possible financial stress are related to customer attrition.
+
+A drop in transaction activity compared to the previous quarter was another key signal. This shows that recent changes in behaviour—not just overall patterns—can help identify at-risk customers before they leave.
+
+Lastly, customers with fewer products or weaker relationships with the bank were more likely to churn. This suggests that increasing relationship depth (e.g., encouraging them to open savings accounts or use more services) may help keep customers loyal.
+
+Based on these findings, Tifosi Bank could take action such as: - **Monitoring drops in transaction activity** and reaching out early - **Offering personalised incentives** to low-activity but high-limit customers - **Improving customer support** for those who contact the bank frequently - **Encouraging multi-product relationships** to build loyalty
+
+By using these predictors, the bank can move from reactive to proactive churn management.
+
+# Strategic Implications
+
+The XGBoost model highlights three key churn drivers: declining transaction activity, low spending, and limited product engagement.
+
+1.  Low transaction frequency and spend signal disengagement. Tifosi Bank should implement monitoring systems to detect early drops in activity. Flagged customers can receive timely re-engagement offers—such as cashback, reminders, or bundled promotions—to restore value before churn occurs.
+
+For example, Bank of America reported a record 23.4 billion digital interactions in 2023, including proactive spend alerts and personalised financial guidance, which contributed to stronger customer engagement across dormant segments (Bank of America, 2024).
+
+2.  Customers with high revolving balances but low usage may be financially stressed or dissatisfied. Targeted support, such as usage-based rewards or flexible payment plans, can rebuild trust and usage without sacrificing profitability.
+
+Similar strategies are used by Capital One, which emphasises retention through personalised balance support, loyalty rewards, and credit plan customisation to address declining engagement in at-risk segments (Capital One, 2021).
+
+3.  Customers using multiple bank products are less likely to churn. Bundling credit cards with savings, insurance, or loyalty programs can deepen relationships and increase switching costs.
+
+A Deloitte insight report noted that banks adopting cross-product strategies—linking digital channels with core banking services—have achieved stronger customer retention and lower churn risk (Deloitte, 2025).
+
+4.  Frequent contact with customer service can signal dissatisfaction. Proactively mining service logs and routing high-risk customers to trained agents helps turn complaints into retention wins.
+
+IBM’s churn classification case study highlights how integrating service frequency data into predictive models enhances churn flagging accuracy and allows prioritised human follow-up for high-contact customers (IBM, 2021).
+
+These actions shift Tifosi Bank from reactive churn control to proactive customer management—boosting customer lifetime value and long-term profitability.
+
+![Churn Strategies](figures/strategy01.png){width="85%" fig-align="center"}
+
+# Conclusion and Limitations
+
+This study used machine learning to tackle a key business challenge at Tifosi Bank: predicting and preventing customer churn. Through a structured modelling process, XGBoost emerged as the most effective classifier, driven by strong signals from transaction activity, engagement depth, and behavioural change.
+
+Beyond technical accuracy, the model’s insights offer real business value. By focusing on declining transactions, low product adoption, and early dissatisfaction signals, the bank can take targeted action to retain high-risk customers.
+
+Looking ahead, future work could explore integrating real-time behaviour tracking and customer feedback into the model. Combining predictive analytics with human-centred engagement will be key to reducing attrition and sustaining long-term growth.
+
+In short, understanding who is likely to leave is only half the battle—the real opportunity lies in knowing what to do before they go.
+
+\newpage
+
+# Reference
+
+Bank of America. (2024). *Digital Engagement Soars at Bank of America to More Than 10 Billion Logins, up 15% Year-Over-Year*.
+
+Capital One. (2021). *Customer Loyalty and Retention Strategies*.
+
+Deloitte. (2025). *Retail and Commercial Banking*.
+
+IBM. (2021). *IBM Telco Customer Churn Analysis*.
+
+------------------------------------------------------------------------
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# KNN Model grid 50
+
+# 1. Define model specs
+#knn_spec <- nearest_neighbor(
+#  neighbors = tune(),
+#  dist_power = tune(),
+#  weight_func = tune()
+#) %>%
+#  set_engine("kknn") %>%
+#  set_mode("classification")
+
+# 2. Define recipe
+#knn_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+#  step_dummy(all_nominal_predictors()) %>%
+#  step_normalize(all_numeric_predictors()) %>%
+#  step_zv(all_predictors())
+
+# 3. Create workflow
+#knn_wf <- workflow() %>%
+#  add_recipe(knn_rec) %>%
+#  add_model(knn_spec)
+
+# 4. Tune hyperparameters 
+#knn_tune_grid50 <- tune_grid(
+#  knn_wf,
+#  resamples = cross_validation_folds,
+#  grid = 50,
+#  metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+#  control = control_grid(
+#    save_pred = TRUE,
+#    event_level = "second",
+#    verbose = TRUE
+#  )
+#)
+
+#
+
+#saveRDS(knn_tune_grid50, file = "models/knn_tune_grid50_result.rds")
+
+
+ #knn_tune_grid50 <- readRDS("models/knn_tune_grid50_result.rds")
+
+# 5. Select best model
+#best_knn <- select_best(knn_tune_grid50, metric = "roc_auc")
+
+# 6. Finalize workflow
+#final_knn_wf <- finalize_workflow(knn_wf, best_knn)
+
+# 7. Fit final model on test set
+#if (file.exists("models/final_knn_fit.rds")) {
+#  final_knn_fit <- readRDS("models/final_knn_fit.rds")
+#} else {
+##  final_knn_fit <- last_fit(
+#    final_knn_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_knn_fit, "models/final_knn_fit.rds")
+#}
+
+# 8. Collect final test performance
+#knn_metrics <- collect_metrics(final_knn_fit)
+
+#knn_metrics
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# Random Forest grid 50
+
+# Recipe for RF
+#rf_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+#  step_dummy(all_nominal_predictors()) %>%
+##  step_zv(all_predictors()) %>%
+#  step_normalize(all_numeric_predictors())
+
+# Model spec
+##rf_spec <- rand_forest(
+#  mtry = tune(),
+#  min_n = tune(),
+#  trees = tune()
+#) %>%
+#  set_engine("ranger", importance = "impurity") %>%
+#  set_mode("classification")
+
+# Workflow
+#rf_wf <- workflow() %>%
+#  add_recipe(rf_rec) %>%
+#  add_model(rf_spec)
+
+# RF tuning
+#rf_tune_grid50 <- tune_grid(
+#  rf_wf,
+#  resamples = cross_validation_folds,
+#  grid = 50,
+#  metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+#  control = control_grid(
+#    save_pred = TRUE,
+#   event_level = "second",
+#    verbose = TRUE,
+#    parallel_over = "everything"
+#  )
+#)
+
+
+#saveRDS(rf_tune_grid50, "models/rf_tune_grid50_result.rds")
+
+
+#  
+#rf_tune <- readRDS("models/rf_tune_grid50_result.rds")
+
+#
+#best_rf <- select_best(rf_tune, metric = "roc_auc")
+
+# 
+#final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+
+# 
+#if (file.exists("models/final_rf_fit.rds")) {
+#  final_rf_fit <- readRDS("models/final_rf_fit.rds")
+##} else {
+#  final_rf_fit <- last_fit(
+#    final_rf_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_rf_fit, "models/final_rf_fit.rds")
+#}
+
+# 
+#rf_metrics <- collect_metrics(final_rf_fit)
+
+```
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+# XGBoost grid 50
+
+# 1. Define model spec
+#xgb_spec <- boost_tree(
+##  trees = tune(),
+#  tree_depth = tune(),
+#  learn_rate = tune(),
+#  loss_reduction = tune(),
+#  sample_size = tune(),
+#  mtry = tune()
+#) %>%
+#  set_engine("xgboost") %>%
+#  set_mode("classification")
+
+# 2. Define recipe
+#xgb_rec <- recipe(attrition_flag ~ ., data = train_data) %>%
+#  step_dummy(all_nominal_predictors()) %>%
+#  step_zv(all_predictors()) %>%
+#  step_normalize(all_numeric_predictors())
+
+# 3. Create workflow
+#xgb_wf <- workflow() %>%
+#  add_model(xgb_spec) %>%
+#  add_recipe(xgb_rec)
+
+# 4. Tuning grid
+#xgb_tune_grid50 <- tune_grid(
+#  xgb_wf,
+#  resamples = cross_validation_folds,
+#  grid = 50,
+#  metrics = metric_set(roc_auc, accuracy, recall, precision, f_meas),
+#  control = control_grid(
+#    save_pred = TRUE,
+#    event_level = "second",
+#    verbose = TRUE,
+#    parallel_over = "everything"
+#  )
+#)
+
+
+#saveRDS(xgb_tune_grid50, "models/xgb_tune_grid50_result.rds")
+
+
+ 
+#xgb_tune <- readRDS("models/xgb_tune_grid50_result.rds")
+
+# 5. Select best
+#best_xgb <- select_best(xgb_tune, metric = "roc_auc")
+
+# 6. Finalize
+#final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+#
+#if (file.exists("models/final_xgb_fit.rds")) {
+#  final_xgb_fit <- readRDS("models/final_xgb_fit.rds")
+#} else {
+#  final_xgb_fit <- last_fit(
+#    final_xgb_wf,
+#    split = data_split,
+#    metrics = metric_set(roc_auc, accuracy, precision, recall, f_meas)
+#  )
+#  saveRDS(final_xgb_fit, "models/final_xgb_fit.rds")
+#}
+
+# 8. Collect performance
+#xgb_metrics <- collect_metrics(final_xgb_fit)
+```
